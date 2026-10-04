@@ -1431,7 +1431,8 @@
       );
       if (others.length) {
         // 行必须是「单个导航项」大小，防止把整列侧栏当成一行克隆
-        const ok = node.querySelectorAll("a[href]").length === 1 && node.getBoundingClientRect().height <= 120;
+        const links = node.matches("a[href]") ? 1 : node.querySelectorAll("a[href]").length;
+        const ok = links === 1 && node.getBoundingClientRect().height <= 120;
         return ok && others.length >= 2 ? { list, row: node } : null;
       }
       node = list;
