@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/exynos967/x-bookmark-folders/issues
 // @updateURL    https://raw.githubusercontent.com/exynos967/x-bookmark-folders/main/x-bookmark-folders.user.js
 // @downloadURL  https://raw.githubusercontent.com/exynos967/x-bookmark-folders/main/x-bookmark-folders.user.js
-// @version      1.7.1
+// @version      1.7.2
 // @description  无需 X Premium 的本地书签文件夹。电脑端入口在左侧栏 Money 下方，手机端入口在头像抽屉菜单 Money 下方；帖子「分享」按钮右侧新增文件夹按钮，可选择放入哪个文件夹；支持 WebDAV 跨浏览器同步。
 // @match        https://x.com/*
 // @run-at       document-idle
@@ -18,7 +18,7 @@
 
 (function () {
   "use strict";
-  document.documentElement.dataset.xbf = "1.7.1"; // 运行标记，方便在控制台确认脚本已生效
+  document.documentElement.dataset.xbf = "1.7.2"; // 运行标记，方便在控制台确认脚本已生效
 
   // ───────────────────────── i18n ─────────────────────────
   const ZH = /^zh/i.test(document.documentElement.lang || navigator.language);
@@ -757,6 +757,9 @@
     const icon = tpl.content.firstElementChild;
     icon.setAttribute("width", "1em");
     icon.setAttribute("height", "1em");
+    const r = old.getBoundingClientRect();
+    if (old.getAttribute("style")) icon.setAttribute("style", old.getAttribute("style"));
+    else if (r.width) Object.assign(icon.style, { width: r.width + "px", height: r.height + "px" }); // 保持原图标的实际尺寸
     old.replaceWith(icon);
     return icon;
   }
@@ -1408,56 +1411,96 @@
     return { el, label };
   }
 
-  function buildNavItem(src, kind) {
-    const { el: a, label } = cloneNative(src, T.entry);
-    a.setAttribute("href", "#");
-    a.dataset.xbfNav = kind;
+  /** 导航项：带图标的站内链接，且不在帖子 / 正文区域里 */
+  const isNavLink = (a) =>
+    !a.dataset.xbfNav &&
+    a.getAttribute("href")?.startsWith("/") &&
+    a.querySelector("svg") &&
+    !a.closest("article, main, [data-testid='primaryColumn']");
+
+  /**
+   * 从链接向上找到「列表中的一行」：row 是 list 的直接子节点，list 里还有其它导航项。
+   * 兼容 <nav><a/></nav>、<div><div><a/></div><div><a/></div></div> 等各种包裹层级。
+   */
+  function rowOf(link) {
+    let node = link;
+    while (node.parentElement && node.parentElement !== document.body) {
+      const list = node.parentElement;
+      const others = [...list.querySelectorAll("a[href]")].filter(
+        (x) => isNavLink(x) && !node.contains(x),
+      );
+      if (others.length) {
+        // 行必须是「单个导航项」大小，防止把整列侧栏当成一行克隆
+        const ok = node.querySelectorAll("a[href]").length === 1 && node.getBoundingClientRect().height <= 120;
+        return ok && others.length >= 2 ? { list, row: node } : null;
+      }
+      node = list;
+    }
+    return null;
+  }
+
+  /** 手机抽屉在 [role=dialog] 或 #layers（旧版）里；其余视为电脑端侧边栏 */
+  const kindOf = (el) =>
+    el.closest('[role="dialog"], #layers') ? "mobile" : "desktop";
+
+  function buildNavItem(row, anchor, kind) {
+    const { el: item, label } = cloneNative(row, T.entry);
+    // row 可能是包着链接的容器：把里面的链接也改掉，避免点到原入口
+    for (const a of [item, ...item.querySelectorAll("a")]) {
+      if (a.tagName !== "A") continue;
+      a.setAttribute("href", "#");
+      a.setAttribute("aria-label", T.entry);
+      ["aria-current", "data-testid", "data-status"].forEach((k) => a.removeAttribute(k));
+    }
+    item.dataset.xbfNav = kind;
     label?.classList.add("xbf-nav-label");
 
-    a.addEventListener("click", (e) => {
+    item.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      // 手机端：先关闭抽屉（点击其遮罩），再打开面板
+      // 手机端：先关闭抽屉（新版点遮罩；旧版发 Esc），再打开面板
       if (kind === "mobile") {
-        const mask = a.closest('[role="dialog"]')?.previousElementSibling;
+        const mask = item.closest('[role="dialog"]')?.previousElementSibling;
         if (mask?.getAttribute("aria-hidden") === "true") mask.click();
+        else
+          document.dispatchEvent(
+            new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }),
+          );
       }
       openPanel();
     });
-    return a;
+    return item;
   }
 
-  /** 把入口放到锚点所在的 nav 直接子节点之后（兼容折叠态 tooltip 包裹） */
-  function placeAfter(nav, anchor, kind) {
-    let node = anchor;
-    while (node.parentElement && node.parentElement !== nav)
-      node = node.parentElement;
-    const existing = nav.querySelector('[data-xbf-nav="' + kind + '"]');
-    if (
-      existing &&
-      existing.dataset.xbfFrom === pathOf(anchor) &&
-      node.nextElementSibling === existing
-    )
-      return;
+  /** 把入口放到锚点那一行之后；位置已正确时不重复插入 */
+  function placeAfter(list, row, anchor, kind) {
+    const existing = list.querySelector(":scope > [data-xbf-nav]");
+    if (existing && existing.dataset.xbfFrom === pathOf(anchor) && row.nextElementSibling === existing) return;
     existing?.remove();
-    const item = buildNavItem(anchor, kind);
+    const item = buildNavItem(row, anchor, kind);
     item.dataset.xbfFrom = pathOf(anchor);
-    node.after(item);
+    row.after(item);
   }
 
   function injectNav() {
+    // 1. 按 Money → Premium → 历史 → 书签 的优先级，在每个导航列表里找锚点
+    const done = new Set();
+    const candidates = [...document.querySelectorAll("a[href]")].filter(
+      (a) => isNavLink(a) && ANCHORS.includes(pathOf(a)),
+    );
+    candidates.sort((x, y) => ANCHORS.indexOf(pathOf(x)) - ANCHORS.indexOf(pathOf(y)));
+    for (const anchor of candidates) {
+      const hit = rowOf(anchor);
+      if (!hit || done.has(hit.list)) continue;
+      done.add(hit.list);
+      placeAfter(hit.list, hit.row, anchor, kindOf(hit.list));
+    }
+    // 2. 新版 x-web 电脑端侧边栏一定是主导航：没有任何锚点时挂在末尾
     for (const nav of document.querySelectorAll("nav")) {
-      const kind = nav.closest('[role="dialog"]') ? "mobile" : "desktop";
-      const links = [...nav.querySelectorAll("a[href]")].filter(
-        (a) => !a.dataset.xbfNav && a.querySelector("svg"),
-      );
-      // x-web 电脑端侧边栏一定是主导航，找不到锚点时挂在末尾；其它 nav 必须命中锚点才注入，避免误伤
-      const isXwebRail =
-        kind === "desktop" &&
-        links.some((a) => a.querySelector("[data-sidebar-label]"));
-      const anchor =
-        pickAnchor(links) || (isXwebRail ? links[links.length - 1] : null);
-      if (anchor) placeAfter(nav, anchor, kind);
+      const links = [...nav.querySelectorAll("a[href]")].filter(isNavLink);
+      if (!links.some((a) => a.querySelector("[data-sidebar-label]"))) continue;
+      const hit = rowOf(links[links.length - 1]);
+      if (hit && !done.has(hit.list)) placeAfter(hit.list, hit.row, links[links.length - 1], "desktop");
     }
   }
 
